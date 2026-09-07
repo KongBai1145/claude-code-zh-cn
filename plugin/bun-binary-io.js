@@ -3,7 +3,7 @@
  * bun-binary-io.js — Bun 原生二进制 I/O 工具
  *
  * 从 tweakcc (Piebald-AI/tweakcc) 的 nativeInstallation.ts 精简移植。
- * 支持 macOS (Mach-O) 与 Windows (PE)，仍按平台版本窗口开放。
+ * 支持 macOS (Mach-O)、Linux (ELF) 与 Windows (PE)，仍按平台版本窗口开放。
  *
  * CLI 子命令：
  *   detect <claude-cmd>     → 输出 "npm:<path>" 或 "native-bun:<path>" 或 "unknown"
@@ -11,6 +11,7 @@
  *   repack <binary> <js>    → 将修改后的 JS 写回二进制（macOS 含 codesign）
  *   version <binary>        → 输出二进制内嵌的版本号
  *   resolve <path>          → 输出 realpath（跨平台 symlink 解析）
+ *   probe <binary>          → 输出容器形态："source-js" / "bytecode" / "unknown"
  *   check-deps              → 检查 node-lief 是否可用
  */
 
@@ -31,6 +32,15 @@ const SIZEOF_OFFSETS = 32;
 const SIZEOF_STRING_POINTER = 8;
 const SIZEOF_MODULE_OLD = 4 * SIZEOF_STRING_POINTER + 4; // 36
 const SIZEOF_MODULE_NEW = 6 * SIZEOF_STRING_POINTER + 4; // 52
+const JS_SOURCE_ENCODING_UTF8 = 0;
+const BYTECODE_STUB_MARKER = "// @bun";
+// bytecode 编译容器不支持 Layer 4；用独立退出码方便上层区分"格式不支持"与一般失败。
+const UNSUPPORTED_BYTECODE_EXIT_CODE = 3;
+// Bun 编译的 claude bundle 一律以 "// @bun ..." 横幅开头（实测 2.1.220 的完整
+// 源码 ~21MB 也带 "// @bun @bytecode @bun-cjs"），横幅本身不是 stub 特征；
+// 区别在体量：bytecode 编译构建（Windows 2.1.24x 起）的入口模块只剩几十 KB
+// 的 stub，真实 UI 文案在编译后的 bytecode chunk 里，重打包必然产出损坏二进制。
+const BYTECODE_STUB_MAX_BYTES = 1024 * 1024;
 
 // ============================================================================
 // node-lief 加载
@@ -115,9 +125,8 @@ function detectInstallation(claudeCmd) {
   try { realPath = fs.realpathSync(claudeCmd); } catch { return "unknown"; }
 
   // 2. 先判真实目标本身是不是 Bun 二进制（Codex 二审 #1）
-  //    仅支持 Mach-O（macOS），ELF (Linux) 暂不开放
   const format = detectBinaryFormat(realPath);
-  if ((format === "MachO64" || format === "MachO32" || format === "PE") && hasBunTrailer(realPath)) {
+  if ((format === "MachO64" || format === "MachO32" || format === "ELF" || format === "PE") && hasBunTrailer(realPath)) {
     return "native-bun:" + realPath;
   }
 
@@ -135,7 +144,7 @@ function detectInstallation(claudeCmd) {
     "node_modules/@anthropic-ai/claude-code/bin/claude.exe");
   if (fs.existsSync(npmExe)) {
     const exeFormat = detectBinaryFormat(npmExe);
-    if ((exeFormat === "PE" || exeFormat === "MachO64" || exeFormat === "MachO32") && hasBunTrailer(npmExe)) {
+    if ((exeFormat === "PE" || exeFormat === "ELF" || exeFormat === "MachO64" || exeFormat === "MachO32") && hasBunTrailer(npmExe)) {
       return "native-bun:" + npmExe;
     }
   }
@@ -150,7 +159,7 @@ function detectInstallation(claudeCmd) {
     const npmExe2 = path.join(globalRoot, "@anthropic-ai/claude-code/bin/claude.exe");
     if (fs.existsSync(npmExe2)) {
       const exeFormat2 = detectBinaryFormat(npmExe2);
-      if ((exeFormat2 === "PE" || exeFormat2 === "MachO64" || exeFormat2 === "MachO32") && hasBunTrailer(npmExe2)) {
+      if ((exeFormat2 === "PE" || exeFormat2 === "ELF" || exeFormat2 === "MachO64" || exeFormat2 === "MachO32") && hasBunTrailer(npmExe2)) {
         return "native-bun:" + npmExe2;
       }
     }
@@ -198,8 +207,12 @@ function detectModuleStructSize(modulesListLength) {
 }
 
 function isClaudeModule(moduleName) {
+  // 2.1.227+ 的 Bun 入口模块从 /claude（或 src/entrypoints/cli.js）改名为
+  // /cli（PE 下为 B:/~BUN/root/cli，Mach-O 下为 /$bunfs/root/cli）。
   return moduleName.endsWith("/claude") ||
     moduleName === "claude" ||
+    moduleName.endsWith("/cli") ||
+    moduleName === "cli" ||
     moduleName.endsWith("/src/entrypoints/cli.js") ||
     moduleName === "src/entrypoints/cli.js";
 }
@@ -328,6 +341,12 @@ function extractNativeBun(LIEF, binaryPath) {
       }
       throw new Error("Bun section not found in PE binary");
     }
+    case "ELF": {
+      const section = binary.getSection(".bun");
+      if (!section) throw new Error(".bun section not found in ELF binary");
+      const parsed = extractBunDataFromSection(section.content);
+      return { ...parsed, format: "ELF", binary, section };
+    }
     default:
       throw new Error(`Unsupported native binary format: ${binary.format || "unknown"}`);
   }
@@ -351,6 +370,26 @@ function findClaudeModule(bunData, bunOffsets, moduleStructSize) {
   return null;
 }
 
+// 2.1.24x 起 Windows 构建改用 Bun bytecode 编译 + 模块 chunk 拆分：入口模块的
+// contents 只剩几十 KB 的 "// @bun" stub，UI 文案搬进了编译后的 bytecode。
+// 对这种容器做 extract→patch→repack 会产出体积缩水、启动即 segfault 的二进制，
+// 必须在写盘前拒绝。判据只看「带 Bun 横幅但体量远小于任何真实 bundle」，
+// 不能看横幅本身——横幅在可正常 patch 的历史版本里同样存在。
+function claudeBytecodeGuardReason(found) {
+  const head = found.contents.subarray(0, 32).toString("utf-8").trimStart();
+  if (!head.startsWith(BYTECODE_STUB_MARKER)) return "";
+  if (found.contents.length >= BYTECODE_STUB_MAX_BYTES) return "";
+  return `entry module source is only a ${found.contents.length}-byte "${BYTECODE_STUB_MARKER}" stub instead of the bundled JS payload`;
+}
+
+function refuseBytecodeContainer(reason) {
+  process.stderr.write(
+    `Error: unsupported Bun bytecode container (${reason}); the UI strings are no longer present as JS source\n` +
+    "Refusing to extract/patch this build because repacking it would corrupt the executable.\n"
+  );
+  process.exit(UNSUPPORTED_BYTECODE_EXIT_CODE);
+}
+
 function rebuildBunData(bunData, bunOffsets, modifiedClaudeJs, moduleStructSize) {
   const modulesListBytes = getStringPointerContent(bunData, bunOffsets.modulesPtr);
   const count = Math.floor(modulesListBytes.length / moduleStructSize);
@@ -364,7 +403,8 @@ function rebuildBunData(bunData, bunOffsets, modifiedClaudeJs, moduleStructSize)
     const nameBytes = getStringPointerContent(bunData, mod.name);
     const moduleName = nameBytes.toString("utf-8");
 
-    const contentsBytes = (modifiedClaudeJs && isClaudeModule(moduleName))
+    const isModifiedClaudeModule = Boolean(modifiedClaudeJs && isClaudeModule(moduleName));
+    const contentsBytes = isModifiedClaudeModule
       ? modifiedClaudeJs
       : getStringPointerContent(bunData, mod.contents);
     const sourcemapBytes = getStringPointerContent(bunData, mod.sourcemap);
@@ -375,7 +415,8 @@ function rebuildBunData(bunData, bunOffsets, modifiedClaudeJs, moduleStructSize)
     modulesMetadata.push({
       name: nameBytes, contents: contentsBytes, sourcemap: sourcemapBytes,
       bytecode: bytecodeBytes, moduleInfo: moduleInfoBytes, bytecodeOriginPath: bytecodeOriginPathBytes,
-      encoding: mod.encoding, loader: mod.loader, moduleFormat: mod.moduleFormat, side: mod.side,
+      encoding: isModifiedClaudeModule ? JS_SOURCE_ENCODING_UTF8 : mod.encoding,
+      loader: mod.loader, moduleFormat: mod.moduleFormat, side: mod.side,
     });
 
     if (moduleStructSize === SIZEOF_MODULE_NEW) {
@@ -508,10 +549,10 @@ function signAndVerifyMachO(outputPath) {
   runCodesign(["--verify", "--strict", "--verbose=4", outputPath], "verify");
 }
 
-function verifyPERepack(LIEF, outputPath, expectedBunBuffer) {
+function verifyNativeRepack(LIEF, outputPath, expectedBunBuffer, format) {
   const { bunData } = extractNativeBun(LIEF, outputPath);
   if (!bunData.equals(expectedBunBuffer)) {
-    throw new Error("PE repack verification failed: embedded Bun data did not round-trip");
+    throw new Error(`${format} repack verification failed: embedded Bun data did not round-trip`);
   }
 }
 
@@ -555,7 +596,41 @@ function repackPE(LIEF, peBinary, binPath, newBunBuffer, outputPath, sectionHead
   }
 
   atomicWriteBinary(LIEF, peBinary, outputPath, binPath);
-  verifyPERepack(LIEF, outputPath, newBunBuffer);
+  verifyNativeRepack(LIEF, outputPath, newBunBuffer, "PE");
+}
+
+function repackELF(LIEF, elfBinary, binPath, newBunBuffer, outputPath, sectionHeaderSize, section) {
+  const newSectionData = buildSectionData(newBunBuffer, sectionHeaderSize);
+  const sizeDiff = newSectionData.length - Number(section.size);
+
+  if (sizeDiff > 0) {
+    if (typeof elfBinary.pageSize !== "function" || typeof elfBinary.extend !== "function") {
+      throw new Error("Growing an ELF Bun section requires node-lief 1.3.0 or newer");
+    }
+    const sectionName = section.name;
+    const sectionStart = BigInt(section.fileOffset);
+    const sectionEnd = sectionStart + BigInt(section.size);
+    const loadSegment = elfBinary.segments().find((candidate) => {
+      const segmentStart = BigInt(candidate.fileOffset);
+      const segmentEnd = segmentStart + BigInt(candidate.fileSize);
+      return candidate.type === "LOAD" && segmentStart <= sectionStart && sectionEnd <= segmentEnd;
+    });
+    if (!loadSegment) throw new Error("ELF LOAD segment containing Bun section not found");
+
+    const pageSize = BigInt(elfBinary.pageSize());
+    const alignedSizeDiff = ((BigInt(sizeDiff) + pageSize - 1n) / pageSize) * pageSize;
+    if (!elfBinary.extend(loadSegment, alignedSizeDiff)) {
+      throw new Error("Failed to extend ELF LOAD segment");
+    }
+
+    section = elfBinary.getSection(sectionName);
+    if (!section) throw new Error("Bun section not found after extending ELF LOAD segment");
+  }
+
+  section.content = newSectionData;
+  section.size = BigInt(newSectionData.length);
+  atomicWriteBinary(LIEF, elfBinary, outputPath, binPath);
+  verifyNativeRepack(LIEF, outputPath, newBunBuffer, "ELF");
 }
 
 // ============================================================================
@@ -590,7 +665,24 @@ function cmdExtract() {
     process.exit(1);
   }
 
-  fs.writeFileSync(outputPath, found.contents);
+  const bytecodeReason = claudeBytecodeGuardReason(found);
+  if (bytecodeReason) {
+    refuseBytecodeContainer(bytecodeReason);
+  }
+
+  if (fs.existsSync(outputPath) && fs.lstatSync(outputPath).isSymbolicLink()) {
+    process.stderr.write("Error: refusing to write through symbolic link output path\n");
+    process.exit(1);
+  }
+
+  const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC |
+    (fs.constants.O_NOFOLLOW || 0);
+  const output = fs.openSync(outputPath, flags, 0o600);
+  try {
+    fs.writeFileSync(output, found.contents);
+  } finally {
+    fs.closeSync(output);
+  }
   process.stdout.write("ok");
 }
 
@@ -611,6 +703,15 @@ function cmdRepack() {
   LIEF.logging.disable();
   const modifiedJs = fs.readFileSync(jsPath);
   const { format, binary, section, segment, bunOffsets, bunData, sectionHeaderSize, moduleStructSize } = extractNativeBun(LIEF, binaryPath);
+
+  const currentModule = findClaudeModule(bunData, bunOffsets, moduleStructSize);
+  if (currentModule) {
+    const bytecodeReason = claudeBytecodeGuardReason(currentModule);
+    if (bytecodeReason) {
+      refuseBytecodeContainer(bytecodeReason);
+    }
+  }
+
   const newBuffer = rebuildBunData(bunData, bunOffsets, modifiedJs, moduleStructSize);
 
   switch (format) {
@@ -619,6 +720,9 @@ function cmdRepack() {
       break;
     case "PE":
       repackPE(LIEF, binary, binaryPath, newBuffer, binaryPath, sectionHeaderSize, section);
+      break;
+    case "ELF":
+      repackELF(LIEF, binary, binaryPath, newBuffer, binaryPath, sectionHeaderSize, section);
       break;
     default:
       process.stderr.write(`Error: unsupported native binary format ${format || "unknown"}\n`);
@@ -630,6 +734,10 @@ function cmdRepack() {
 function isClaudePackageName(name) {
   return name === "@anthropic-ai/claude-code" ||
     name === "@anthropic-ai/claude-code-darwin-arm64" ||
+    name === "@anthropic-ai/claude-code-linux-x64" ||
+    name === "@anthropic-ai/claude-code-linux-arm64" ||
+    name === "@anthropic-ai/claude-code-linux-x64-musl" ||
+    name === "@anthropic-ai/claude-code-linux-arm64-musl" ||
     name === "@anthropic-ai/claude-code-win32-x64";
 }
 
@@ -719,6 +827,34 @@ function cmdVersion() {
   process.stdout.write(readPackageVersionNearBinary(binaryPath) || readExecutableVersion(binaryPath) || "");
 }
 
+function cmdProbe() {
+  const binaryPath = process.argv[3];
+  if (!binaryPath) {
+    process.stderr.write("Usage: bun-binary-io.js probe <binary>\n");
+    process.exit(1);
+  }
+
+  const LIEF = loadNodeLief();
+  if (!LIEF) {
+    process.stderr.write("Error: node-lief not found. Install with: npm install -g node-lief\n");
+    process.exit(1);
+  }
+
+  try {
+    LIEF.logging.disable();
+    const { bunData, bunOffsets, moduleStructSize } = extractNativeBun(LIEF, binaryPath);
+    const found = findClaudeModule(bunData, bunOffsets, moduleStructSize);
+    if (!found || found.contents.length === 0) {
+      process.stdout.write("unknown");
+      return;
+    }
+    process.stdout.write(claudeBytecodeGuardReason(found) ? "bytecode" : "source-js");
+  } catch {
+    // 解析失败时无法判定容器形态；具体错误由 extract/repack 自己给出。
+    process.stdout.write("unknown");
+  }
+}
+
 function cmdResolve() {
   const inputPath = process.argv[3];
   if (!inputPath) {
@@ -773,12 +909,13 @@ switch (command) {
   case "repack": cmdRepack(); break;
   case "version": cmdVersion(); break;
   case "resolve": cmdResolve(); break;
+  case "probe": cmdProbe(); break;
   case "check-deps": cmdCheckDeps(); break;
   case "hash": cmdHash(); break;
   default:
     process.stderr.write(
       "Usage: bun-binary-io.js <command> [args...]\n" +
-      "Commands: detect, extract, repack, version, resolve, check-deps, hash\n"
+      "Commands: detect, extract, repack, version, resolve, probe, check-deps, hash\n"
     );
     process.exit(1);
 }
